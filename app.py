@@ -196,30 +196,42 @@ def safe_float(value):
         return 0
 
 
+def normalize_stock_code(code):
+    """标准化股票代码，添加交易所前缀"""
+    code = str(code).strip()
+    # 移除可能的后缀
+    if '.' in code:
+        code = code.split('.')[0]
+    
+    # 根据代码规则判断交易所
+    if code.startswith('6'):
+        return f"sh{code}"  # 上海证券交易所
+    elif code.startswith(('0', '3', '2')):
+        return f"sz{code}"  # 深圳证券交易所
+    elif code.startswith('8') or code.startswith('4'):
+        return f"bj{code}"  # 北京证券交易所
+    else:
+        return f"sh{code}"  # 默认上海
+
+
 def get_financial_indicators(ticker, start_year=2016, end_year=2024):
     """使用AkShare获取核心财务指标"""
     code = ticker.split('.')[0] if '.' in ticker else ticker
+    code_with_prefix = normalize_stock_code(code)
     
-    # 自动检测最新可用年份
-    actual_end_year = start_year
-    for test_year in range(end_year, start_year - 1, -1):
-        try:
-            df_test = ak.stock_yjbb_em(date=f"{test_year}1231")
-            df_stock_test = df_test[df_test['股票代码'] == code]
-            if not df_stock_test.empty:
-                actual_end_year = test_year
-                break
-        except:
-            continue
+    result_data = {}
     
-    end_year = actual_end_year
-    
+    # 尝试多个数据源
+    # 方法1: 使用业绩报表接口
     try:
-        result_data = {}
-        
-        for year in range(start_year, end_year + 1):
+        for year in range(end_year, start_year - 1, -1):
             try:
                 df_yjbb = ak.stock_yjbb_em(date=f"{year}1231")
+                
+                # 打印列名用于调试（仅在出错时显示）
+                if st.session_state.get('debug_mode', False):
+                    st.write(f"{year}年列名:", df_yjbb.columns.tolist())
+                
                 df_stock = df_yjbb[df_yjbb['股票代码'] == code]
                 
                 if df_stock.empty:
@@ -228,12 +240,13 @@ def get_financial_indicators(ticker, start_year=2016, end_year=2024):
                 row = df_stock.iloc[0]
                 year_str = f"{year}年报"
                 
-                revenue = row.get('营业总收入-营业总收入', 0)
-                profit = row.get('净利润-净利润', 0)
-                roe = row.get('净资产收益率', 0)
-                margin = row.get('销售毛利率', 0)
-                revenue_yoy = row.get('营业总收入-同比增长', 0)
-                profit_yoy = row.get('净利润-同比增长', 0)
+                # 尝试不同的列名格式
+                revenue = row.get('营业收入', row.get('营业总收入', row.get('营业总收入-营业总收入', 0)))
+                profit = row.get('净利润', row.get('归属净利润', row.get('净利润-净利润', 0)))
+                roe = row.get('净资产收益率', row.get('ROE', row.get('加权平均净资产收益率', 0)))
+                margin = row.get('毛利率', row.get('销售毛利率', 0))
+                revenue_yoy = row.get('营业收入同比增长', row.get('营业总收入同比增长', row.get('营业总收入-同比增长', 0)))
+                profit_yoy = row.get('净利润同比增长', row.get('归属净利润同比增长', row.get('净利润-同比增长', 0)))
                 
                 year_data = {
                     '营业总收入(亿元)': safe_float(revenue) / 1e8,
@@ -250,59 +263,68 @@ def get_financial_indicators(ticker, start_year=2016, end_year=2024):
                     '研发费用(亿元)': None,
                 }
                 
-                # 获取利润表数据
+                # 获取详细财务报表数据
                 try:
-                    df_profit = ak.stock_financial_report_sina(stock=code, symbol="利润表")
-                    df_profit['报告日'] = pd.to_datetime(df_profit['报告日'])
-                    year_profit = df_profit[df_profit['报告日'].dt.year == year]
-                    
-                    if not year_profit.empty:
-                        p_row = year_profit.iloc[0]
+                    df_profit = ak.stock_financial_report_sina(stock=code_with_prefix, symbol="利润表")
+                    if not df_profit.empty and '报告日' in df_profit.columns:
+                        df_profit['报告日'] = pd.to_datetime(df_profit['报告日'])
+                        year_profit = df_profit[df_profit['报告日'].dt.year == year]
                         
-                        if revenue > 0:
-                            year_data['销售净利率(%)'] = (safe_float(profit) / revenue) * 100
-                        
-                        sales_exp = safe_float(p_row.get('销售费用', p_row.get('营业费用', 0)))
-                        admin_exp = safe_float(p_row.get('管理费用', 0))
-                        fina_exp = safe_float(p_row.get('财务费用', 0))
-                        rd_exp = safe_float(p_row.get('研发费用', p_row.get('研究开发费', 0)))
-                        
-                        if revenue > 0:
-                            year_data['销售费用/营业总收入(%)'] = (sales_exp / revenue) * 100
-                            year_data['管理费用/营业总收入(%)'] = (admin_exp / revenue) * 100
-                            year_data['财务费用/营业总收入(%)'] = (fina_exp / revenue) * 100
-                        
-                        if rd_exp > 0:
-                            year_data['研发费用(亿元)'] = rd_exp / 1e8
-                except:
-                    pass
+                        if not year_profit.empty:
+                            p_row = year_profit.iloc[0]
+                            
+                            revenue_val = safe_float(revenue)
+                            if revenue_val > 0:
+                                profit_val = safe_float(profit)
+                                year_data['销售净利率(%)'] = (profit_val / revenue_val) * 100
+                            
+                            sales_exp = safe_float(p_row.get('销售费用', p_row.get('营业费用', 0)))
+                            admin_exp = safe_float(p_row.get('管理费用', 0))
+                            fina_exp = safe_float(p_row.get('财务费用', 0))
+                            rd_exp = safe_float(p_row.get('研发费用', p_row.get('研究开发费', 0)))
+                            
+                            if revenue_val > 0:
+                                year_data['销售费用/营业总收入(%)'] = (sales_exp / revenue_val) * 100
+                                year_data['管理费用/营业总收入(%)'] = (admin_exp / revenue_val) * 100
+                                year_data['财务费用/营业总收入(%)'] = (fina_exp / revenue_val) * 100
+                            
+                            if rd_exp > 0:
+                                year_data['研发费用(亿元)'] = rd_exp / 1e8
+                except Exception as e:
+                    if st.session_state.get('debug_mode', False):
+                        st.warning(f"利润表获取失败: {e}")
                 
                 # 获取资产负债表数据
                 try:
-                    df_balance = ak.stock_financial_report_sina(stock=code, symbol="资产负债表")
-                    df_balance['报告日'] = pd.to_datetime(df_balance['报告日'])
-                    year_balance = df_balance[df_balance['报告日'].dt.year == year]
-                    
-                    if not year_balance.empty:
-                        b_row = year_balance.iloc[0]
+                    df_balance = ak.stock_financial_report_sina(stock=code_with_prefix, symbol="资产负债表")
+                    if not df_balance.empty and '报告日' in df_balance.columns:
+                        df_balance['报告日'] = pd.to_datetime(df_balance['报告日'])
+                        year_balance = df_balance[df_balance['报告日'].dt.year == year]
                         
-                        total_assets = safe_float(b_row.get('资产总计', b_row.get('总资产', 0)))
-                        if total_assets > 0 and revenue > 0:
-                            year_data['总资产周转率(次)'] = (revenue / total_assets)
-                except:
-                    pass
+                        if not year_balance.empty:
+                            b_row = year_balance.iloc[0]
+                            
+                            total_assets = safe_float(b_row.get('资产总计', b_row.get('总资产', 0)))
+                            revenue_val = safe_float(revenue)
+                            if total_assets > 0 and revenue_val > 0:
+                                year_data['总资产周转率(次)'] = revenue_val / total_assets
+                except Exception as e:
+                    if st.session_state.get('debug_mode', False):
+                        st.warning(f"资产负债表获取失败: {e}")
                 
                 result_data[year_str] = year_data
                 
-            except:
+            except Exception as e:
+                if st.session_state.get('debug_mode', False):
+                    st.warning(f"{year}年数据获取失败: {e}")
                 continue
         
         if result_data:
             result_df = pd.DataFrame(result_data)
             return result_df
             
-    except:
-        pass
+    except Exception as e:
+        st.error(f"数据获取出错: {e}")
     
     return pd.DataFrame()
 
@@ -310,6 +332,10 @@ def get_financial_indicators(ticker, start_year=2016, end_year=2024):
 # ==================== Streamlit 页面 ====================
 
 def main():
+    # 初始化session state
+    if 'debug_mode' not in st.session_state:
+        st.session_state.debug_mode = False
+    
     st.set_page_config(
         page_title="股票财务分析系统",
         page_icon="📊",
@@ -344,6 +370,12 @@ def main():
         )
         
         st.markdown("---")
+        
+        # 调试模式开关
+        with st.expander("🔧 高级选项"):
+            st.session_state.debug_mode = st.checkbox("开启调试模式", value=False, 
+                                                       help="开启后会显示详细错误信息")
+        
         st.markdown("### 📌 使用说明")
         st.markdown("""
         1. 输入A股股票代码（无需后缀）
@@ -379,7 +411,32 @@ def main():
             
             if df_indicators.empty:
                 progress_placeholder.empty()
-                st.error(f"❌ 未找到股票 {code} 的财务数据，请检查代码是否正确。")
+                st.error(f"❌ 未找到股票 {code} 的财务数据")
+                
+                st.info("""
+                **可能的原因和解决方案：**
+                
+                1. **股票代码错误** - 请确认输入的是正确的A股代码（如：600519、000001）
+                
+                2. **网络问题** - AkShare需要访问国内财经网站，如果部署在海外服务器可能被限制
+                
+                3. **数据源问题** - 某些股票可能没有完整的财务数据
+                
+                **建议：**
+                - 尝试在本地运行此应用
+                - 或者使用其他数据源（如Tushare、AKShare的替代接口）
+                """)
+                
+                # 调试模式下显示更多技术信息
+                if st.session_state.get('debug_mode', False):
+                    st.warning("调试模式：尝试显示可用的股票列名...")
+                    try:
+                        test_df = ak.stock_yjbb_em(date="20231231")
+                        st.write("数据源列名:", test_df.columns.tolist()[:10])
+                        st.write("示例数据行:", test_df.head(1).to_dict())
+                    except Exception as debug_e:
+                        st.error(f"调试信息获取失败: {debug_e}")
+                
                 return
             
             progress_bar.progress(80)
